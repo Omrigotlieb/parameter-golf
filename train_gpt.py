@@ -579,6 +579,17 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa: bool = False  # enabled externally for last N layers
+
+    def _xsa(self, y: Tensor, v: Tensor) -> Tensor:
+        """Exclusive Self Attention: subtract the v-aligned component from each query output."""
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        g = H // Hkv
+        y_g = y.reshape(B, T, Hkv, g, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(-2)
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, T, H, D)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -599,7 +610,10 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        y = y.transpose(1, 2)  # [B, T, H, D]
+        if self.use_xsa:
+            y = self._xsa(y, v.transpose(1, 2))  # v: [B, Hkv, T, D] → [B, T, Hkv, D]
+        y = y.contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -645,6 +659,29 @@ class Block(nn.Module):
         return x
 
 
+class BigramHashEmbedding(nn.Module):
+    """Learnable bigram-hash embedding bias. Zero-init so it starts as identity."""
+    def __init__(self, hash_size: int, proj_dim: int, model_dim: int):
+        super().__init__()
+        self.hash_size = hash_size
+        self.embed = nn.Embedding(hash_size, proj_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = nn.Linear(proj_dim, model_dim, bias=False)
+        nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        t = token_ids.to(torch.int32)
+        h = torch.empty_like(t)
+        h[..., 0] = self.hash_size - 1
+        h[..., 1:] = (
+            torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1])
+            % (self.hash_size - 1)
+        )
+        out = self.proj(self.embed(h.long()))
+        return out * self.scale.to(dtype=out.dtype)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -667,6 +704,7 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram_hash = BigramHashEmbedding(hash_size=10240, proj_dim=128, model_dim=model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -685,6 +723,10 @@ class GPT(nn.Module):
             ]
         )
         self.final_norm = RMSNorm()
+        # Enable XSA on last 4 layers
+        for i, block in enumerate(self.blocks):
+            if i >= num_layers - 4:
+                block.attn.use_xsa = True
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
@@ -699,6 +741,7 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        x = x + self.bigram_hash(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []

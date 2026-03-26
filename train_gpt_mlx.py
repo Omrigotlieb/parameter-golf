@@ -323,6 +323,18 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
+        self.use_xsa: bool = False  # enabled externally for last N layers
+
+    def _xsa(self, y: mx.array, v: mx.array) -> mx.array:
+        """XSA: subtract the v-aligned component from each query output head."""
+        B, T, H, D = y.shape
+        Hkv = v.shape[-2]
+        g = H // Hkv
+        y_g = y.reshape(B, T, Hkv, g, D)
+        v_norm = v / mx.sqrt(mx.clip((v * v).sum(axis=-1, keepdims=True), a_min=1e-12, a_max=None))
+        vn = mx.expand_dims(v_norm, axis=-2)  # [B, T, Hkv, 1, D]
+        proj = (y_g * vn).sum(axis=-1, keepdims=True) * vn
+        return (y_g - proj).reshape(B, T, H, D)
 
     def __call__(self, x: mx.array) -> mx.array:
         bsz, seqlen, dim = x.shape
@@ -334,7 +346,10 @@ class CausalSelfAttention(nn.Module):
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
-        y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
+        y = y.transpose(0, 2, 1, 3)  # [B, T, H, D]
+        if self.use_xsa:
+            y = self._xsa(y, v.transpose(0, 2, 1, 3))  # v: [B, Hkv, T, D] → [B, T, Hkv, D]
+        y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
 
@@ -379,6 +394,28 @@ class Block(nn.Module):
         return x
 
 
+class BigramHashEmbedding(nn.Module):
+    """Learnable bigram-hash embedding bias. Zero-init so it starts as identity."""
+    def __init__(self, hash_size: int, proj_dim: int, model_dim: int):
+        super().__init__()
+        self.hash_size = hash_size
+        self.embed = nn.Embedding(hash_size, proj_dim)
+        self.embed.weight = mx.zeros((hash_size, proj_dim), dtype=mx.float32)
+        self.proj = nn.Linear(proj_dim, model_dim, bias=False)
+        self.proj.weight = mx.zeros((model_dim, proj_dim), dtype=mx.float32)
+        self.scale = mx.array(0.05, dtype=mx.float32)
+
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        t = token_ids.astype(mx.int32)
+        # Padding bucket for first token in each sequence
+        pad = mx.full(t.shape[:-1] + (1,), self.hash_size - 1, dtype=mx.int32)
+        # Bigram hash for positions 1..T-1
+        h_rest = mx.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % (self.hash_size - 1)
+        h = mx.concatenate([pad, h_rest], axis=-1)
+        out = self.proj(self.embed(h))
+        return out * self.scale.astype(out.dtype)
+
+
 class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
@@ -394,6 +431,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.bigram_hash = BigramHashEmbedding(hash_size=10240, proj_dim=128, model_dim=dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -403,6 +441,10 @@ class GPT(nn.Module):
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
+        # Enable XSA on last 4 layers
+        for i, block in enumerate(self.blocks):
+            if i >= num_layers - 4:
+                block.attn.use_xsa = True
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
@@ -416,7 +458,9 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+        x = x + self.bigram_hash(input_ids).astype(COMPUTE_DTYPE)
+        x = rms_norm(x)
         x0 = x
         skips: list[mx.array] = []
 
