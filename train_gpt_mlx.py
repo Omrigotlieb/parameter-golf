@@ -1105,10 +1105,11 @@ def main() -> None:
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
 
-        # EMA update (float params only)
+        # EMA update (float params only) — must eval to prevent graph buildup
         for k, v in tree_flatten(model.parameters()):
             if k in ema_params:
                 ema_params[k] = ema_params[k] * EMA_DECAY + v.astype(mx.float32) * (1.0 - EMA_DECAY)
+        mx.eval(ema_params)
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
