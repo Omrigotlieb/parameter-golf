@@ -723,6 +723,65 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
     return out
 
 
+# GPTQ-lite Int6: clip_range=31, best-of-5 percentile search per row.
+
+def gptq_lite_quantize_array(arr: mx.array, clip_range: int = 31) -> tuple[np.ndarray, np.ndarray]:
+    f32 = _np_float32(arr)
+    if f32.ndim == 2:
+        best_q, best_s, best_err = None, None, float("inf")
+        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+            rc = np.quantile(np.abs(f32), pct, axis=1) if pct < 1.0 else np.abs(f32).max(axis=1)
+            s = np.maximum(rc / clip_range, 1.0 / clip_range).astype(np.float16)
+            q = np.clip(np.round(f32 / s[:, None].astype(np.float32)), -clip_range, clip_range).astype(np.int8)
+            err = float(np.mean((f32 - q.astype(np.float32) * s[:, None].astype(np.float32)) ** 2))
+            if err < best_err:
+                best_q, best_s, best_err = q, s, err
+        return np.ascontiguousarray(best_q), np.ascontiguousarray(best_s)
+    amax = float(np.abs(f32).max())
+    s = np.float16(max(amax / clip_range, 1.0 / clip_range))
+    q = np.clip(np.round(f32 / float(s)), -clip_range, clip_range).astype(np.int8)
+    return np.ascontiguousarray(q), s
+
+
+def gptq_lite_quantize_state_dict(flat_state: dict[str, mx.array]) -> dict[str, object]:
+    quantized: dict[str, np.ndarray] = {}
+    scales: dict[str, np.ndarray] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, np.ndarray] = {}
+    pod: dict[str, str] = {}
+    for name, arr in flat_state.items():
+        if not mx.issubdtype(arr.dtype, mx.floating) or int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            passthrough[name] = keep_float_array(name, arr, pod) if mx.issubdtype(arr.dtype, mx.floating) else np.ascontiguousarray(np.array(arr))
+            continue
+        q, s = gptq_lite_quantize_array(arr)
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(arr.dtype).split(".")[-1]
+    obj: dict = {"__quant_format__": "gptq_lite_int6_v1", "quantized": quantized,
+                 "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
+    if pod:
+        obj["passthrough_orig_dtypes"] = pod
+    return obj
+
+
+def dequantize_gptq_lite_state_dict(quant_obj: dict) -> dict[str, mx.array]:
+    out: dict[str, mx.array] = {}
+    pod = quant_obj.get("passthrough_orig_dtypes", {})
+    for name, q in quant_obj["quantized"].items():
+        q_np = np.asarray(q, dtype=np.int8)
+        s = np.asarray(quant_obj["scales"][name], dtype=np.float32)
+        if s.ndim > 0:
+            out_arr = q_np.astype(np.float32) * s.reshape((q_np.shape[0],) + (1,) * (q_np.ndim - 1))
+        else:
+            out_arr = q_np.astype(np.float32) * float(s)
+        out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[quant_obj["dtypes"][name]])
+    for name, arr in quant_obj["passthrough"].items():
+        out_arr = np.array(arr, copy=True)
+        orig_dtype = pod.get(name)
+        out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[orig_dtype]) if orig_dtype else mx.array(out_arr)
+    return out
+
+
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1175,6 +1234,30 @@ def main() -> None:
     q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
     log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
     log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    # GPTQ-lite int6: smaller artifact for 16MB submission limit
+    gptq_obj = gptq_lite_quantize_state_dict(flat_state)
+    gptq_raw = pickle.dumps(gptq_obj, protocol=pickle.HIGHEST_PROTOCOL)
+    gptq_blob = _zstd_mlx.ZstdCompressor(level=22).compress(gptq_raw)
+    gptq_path = out_dir / f"{args.run_id}_mlx_model.int6.ptz"
+    with gptq_path.open("wb") as f:
+        f.write(gptq_blob)
+    code_bytes = len(code.encode("utf-8"))
+    gptq_file_bytes = gptq_path.stat().st_size
+    log(f"GPTQ-lite int6+zstd:{gptq_file_bytes} bytes total_submission:{gptq_file_bytes + code_bytes}")
+
+    with gptq_path.open("rb") as f:
+        gptq_blob_disk = f.read()
+    gptq_flat = dequantize_gptq_lite_state_dict(pickle.loads(_zstd_mlx.ZstdDecompressor().decompress(gptq_blob_disk)))
+    model.update(tree_unflatten(list(gptq_flat.items())))
+    gq_t0 = time.perf_counter()
+    gq_val_loss, gq_val_bpb = eval_val(
+        args, compiled_loss, val_tokens,
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, log_fn=log,
+    )
+    gq_ms = 1000.0 * (time.perf_counter() - gq_t0)
+    log(f"final_int6_gptq_roundtrip val_loss:{gq_val_loss:.4f} val_bpb:{gq_val_bpb:.4f} eval_time:{gq_ms:.0f}ms")
+    log(f"final_int6_gptq_roundtrip_exact val_loss:{gq_val_loss:.8f} val_bpb:{gq_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
