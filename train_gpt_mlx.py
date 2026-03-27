@@ -71,16 +71,18 @@ class Hyperparameters:
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 11))
-    model_dim: int = int(os.environ.get("MODEL_DIM", 512))
-    num_heads: int = int(os.environ.get("NUM_HEADS", 8))
-    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
+    model_dim: int = int(os.environ.get("MODEL_DIM", 640))
+    num_heads: int = int(os.environ.get("NUM_HEADS", 10))
+    num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 5))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 3))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims: int = int(os.environ.get("ROPE_DIMS", 16))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    z_loss_weight: float = float(os.environ.get("Z_LOSS_WEIGHT", 1e-4))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -89,11 +91,11 @@ class Hyperparameters:
     tied_embed_lr: float = float(os.environ.get("TIED_EMBED_LR", 0.05))
     matrix_lr: float = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr: float = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum: float = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps: int = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
     eval_stride: int = int(os.environ.get("EVAL_STRIDE", 64))
     use_ngram_eval: bool = bool(int(os.environ.get("USE_NGRAM_EVAL", "0")))
     ngram_order: int = int(os.environ.get("NGRAM_ORDER", "9"))
@@ -297,18 +299,8 @@ class RMSNormNoWeight(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    # - separate q/k/v projections
-    # - RMSNorm on q and k before attention
-    # - RoPE on q and k
-    # - causal masked SDPA
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
+                 rope_base: float, qk_gain_init: float, rope_dims: int = 0):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -319,15 +311,16 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim)
         self.c_k = CastedLinear(dim, kv_dim)
         self.c_v = CastedLinear(dim, kv_dim)
         self.proj = CastedLinear(dim, dim)
         self.q_gain = mx.ones((num_heads,), dtype=mx.float32) * qk_gain_init
-        self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
+        self.rope = nn.RoPE(self.rope_dims, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
-        self.use_xsa: bool = False  # enabled externally for last N layers
+        self.use_xsa: bool = False
 
     def _xsa(self, y: mx.array, v: mx.array) -> mx.array:
         """XSA: subtract the v-aligned component from each query output head."""
@@ -345,14 +338,22 @@ class CausalSelfAttention(nn.Module):
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
-
-        q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
-        k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
+        q = rms_norm(q).astype(COMPUTE_DTYPE)
+        k = rms_norm(k).astype(COMPUTE_DTYPE)
+        rd = self.rope_dims
+        if rd < self.head_dim:
+            q_rope, q_pass = q[..., :rd], q[..., rd:]
+            k_rope, k_pass = k[..., :rd], k[..., rd:]
+            q = mx.concatenate([self.rope(q_rope), q_pass], axis=-1)
+            k = mx.concatenate([self.rope(k_rope), k_pass], axis=-1)
+        else:
+            q = self.rope(q)
+            k = self.rope(k)
         q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3)  # [B, T, H, D]
         if self.use_xsa:
-            y = self._xsa(y, v.transpose(0, 2, 1, 3))  # v: [B, Hkv, T, D] → [B, T, Hkv, D]
+            y = self._xsa(y, v.transpose(0, 2, 1, 3))
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -370,20 +371,37 @@ class MLP(nn.Module):
         return self.proj(x * x)
 
 
+class ValueEmbedding(nn.Module):
+    def __init__(self, vocab_size: int, ve_dim: int, kv_dim: int):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, ve_dim)
+        self.embed.weight = mx.zeros((vocab_size, ve_dim), dtype=mx.float32)
+        self.proj = nn.Linear(ve_dim, kv_dim, bias=False)
+        self.proj.weight = mx.zeros((kv_dim, ve_dim), dtype=mx.float32)
+        self.scale = mx.array(0.1, dtype=mx.float32)
+
+    def __call__(self, token_ids: mx.array) -> mx.array:
+        return self.proj(self.embed(token_ids.astype(mx.int32))) * self.scale
+
+
+class SmearGate(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = mx.zeros((dim,), dtype=mx.float32)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        g = mx.sigmoid(self.gate.astype(x.dtype))[None, None, :]
+        x_prev = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+        return (1.0 - g) * x + g * x_prev
+
+
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, rope_dims: int = 0):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
@@ -421,31 +439,31 @@ class BigramHashEmbedding(nn.Module):
 
 
 class GPT(nn.Module):
-    # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
-    # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, rope_dims: int = 0, z_loss_weight: float = 0.0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
-
+        self.z_loss_weight = z_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.bigram_hash = BigramHashEmbedding(hash_size=10240, proj_dim=128, model_dim=dim)
+        self.smear_gate = SmearGate(dim)
+        self.vocab_bias = mx.zeros((vocab_size,), dtype=mx.float32)
+        kv_dim = (dim // num_heads) * num_kv_heads
+        self.ve_deep_0 = ValueEmbedding(vocab_size, 128, kv_dim)
+        self.ve_deep_1 = ValueEmbedding(vocab_size, 128, kv_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, rope_dims=rope_dims)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
-        # Enable XSA on last 4 layers
         for i, block in enumerate(self.blocks):
             if i >= num_layers - 4:
                 block.attn.use_xsa = True
@@ -465,6 +483,7 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
         x = x + self.bigram_hash(input_ids).astype(COMPUTE_DTYPE)
         x = rms_norm(x)
+        x = self.smear_gate(x)
         x0 = x
         skips: list[mx.array] = []
 
@@ -480,30 +499,22 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
+    def _logits(self, x: mx.array) -> mx.array:
+        logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T + self.vocab_bias.astype(x.dtype)
+        return self.softcap(logits_proj)
+
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
-        # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
         x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
-        if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
-
-        loss_sum = mx.array(0.0, dtype=mx.float32)
-        n = int(x.shape[0])
-        for s in range(0, n, self.logit_chunk_tokens):
-            e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
-            logits = self.softcap(logits_proj)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+        logits = self._logits(x)
+        ce = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+        if self.z_loss_weight > 0:
+            lse = mx.logsumexp(logits.astype(mx.float32), axis=-1)
+            ce = ce + self.z_loss_weight * (lse * lse).mean()
+        return ce
 
     def forward_logits(self, input_ids: mx.array) -> mx.array:
-        """Returns logits [B, T, vocab] for per-token scoring."""
-        x = self(input_ids)  # [B, T, dim]
-        logits = x @ self.tok_emb.weight.astype(x.dtype).T
-        return self.softcap(logits)
+        return self._logits(self(input_ids))
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -1013,6 +1024,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        rope_dims=args.rope_dims,
+        z_loss_weight=args.z_loss_weight,
     )
     opt = SplitOptimizers(model, args)
 
