@@ -96,6 +96,7 @@ class Hyperparameters:
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    qat_start_fraction: float = float(os.environ.get("QAT_START_FRACTION", 0.15))
     eval_stride: int = int(os.environ.get("EVAL_STRIDE", 64))
     use_ngram_eval: bool = bool(int(os.environ.get("USE_NGRAM_EVAL", "0")))
     ngram_order: int = int(os.environ.get("NGRAM_ORDER", "9"))
@@ -284,12 +285,20 @@ class TokenLoader:
 # ==============================================================================
 
 class CastedLinear(nn.Module):
+    _qat_enabled: bool = False
+
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.astype(x.dtype).T
+        w = self.weight.astype(x.dtype)
+        if CastedLinear._qat_enabled and w.ndim == 2:
+            w32 = self.weight.astype(mx.float32)
+            scale = mx.maximum(mx.abs(w32).max(axis=1) / 31.0, mx.array(1.0 / 31.0))
+            w_q = (mx.clip(mx.round(w32 / scale[:, None]), -31, 31) * scale[:, None]).astype(x.dtype)
+            w = w + mx.stop_gradient(w_q - w)  # STE: forward sees w_q, backward sees w
+        return x @ w.T
 
 
 class RMSNormNoWeight(nn.Module):
@@ -1160,6 +1169,9 @@ def main() -> None:
             break
 
         lr_mul = args.lr_mul(step, train_time_ms + 1000.0 * (time.perf_counter() - t0))
+        if args.qat_start_fraction > 0 and lr_mul < args.qat_start_fraction and not CastedLinear._qat_enabled:
+            CastedLinear._qat_enabled = True
+            log(f"late_qat:enabled step:{step} lr_mul:{lr_mul:.4f}")
         step_t0 = time.perf_counter()
 
         accum: dict[str, mx.array] | None = None
