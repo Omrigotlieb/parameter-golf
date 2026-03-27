@@ -957,12 +957,11 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     if max_norm <= 0:
         return grads_tree
     flat = dict(tree_flatten(grads_tree))
-    total_sq = 0.0
+    total_sq = mx.array(0.0, dtype=mx.float32)
     for grad in flat.values():
-        total_sq += float(np.sum(np.square(_np_float32(grad)), dtype=np.float64))
-    if total_sq <= 0.0:
-        return grads_tree
-    total_norm = math.sqrt(total_sq)
+        total_sq = total_sq + mx.sum(grad.astype(mx.float32) * grad.astype(mx.float32))
+    mx.eval(total_sq)
+    total_norm = math.sqrt(float(total_sq.item()))
     if total_norm <= max_norm:
         return grads_tree
     scale = max_norm / (total_norm + 1e-12)
