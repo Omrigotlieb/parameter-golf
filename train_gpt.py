@@ -27,6 +27,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+try:
+    from flash_attn_interface import flash_attn_func as flash_attn_3_func
+    HAS_FA3 = True
+except ImportError:
+    HAS_FA3 = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -337,7 +343,6 @@ def eval_val(
 # -----------------------------
 
 class NGramCache:
-    """Order-N Katz backoff cache built from already-scored tokens (backward-looking, legal)."""
     def __init__(self, order: int = 9, vocab_size: int = 1024):
         from collections import defaultdict
         self.order = order
@@ -724,8 +729,6 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    # Caches cos/sin tables per sequence length on the current device.
-    # rope_dims controls partial RoPE: only the first rope_dims dims get rotated.
     def __init__(self, dim: int, base: float = 10000.0, rope_dims: int = 0):
         super().__init__()
         self.rope_dims = rope_dims if rope_dims > 0 else dim
@@ -805,26 +808,33 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
-        y = y.transpose(1, 2)  # [B, T, H, D]
-        if self.use_xsa:
-            y = self._xsa(y, v.transpose(1, 2))  # v: [B, Hkv, T, D] → [B, T, Hkv, D]
+        if HAS_FA3 and x.is_cuda:
+            # Flash Attention 3: native [B, T, H, D] layout, auto GQA
+            cos_t = cos.squeeze(1).unsqueeze(2)  # [1,1,T,rd] → [1,T,1,rd]
+            sin_t = sin.squeeze(1).unsqueeze(2)
+            q = apply_rotary_emb(q, cos_t, sin_t)
+            k = apply_rotary_emb(k, cos_t, sin_t)
+            q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
+            y = flash_attn_3_func(q, k, v, causal=True)
+            if self.use_xsa:
+                y = self._xsa(y, v)
+        else:
+            # SDPA fallback: [B, H, T, D] layout
+            q = q.transpose(1, 2); k = k.transpose(1, 2); v_s = v.transpose(1, 2)
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+            y = F.scaled_dot_product_attention(q, k, v_s, attn_mask=None, is_causal=True,
+                                               enable_gqa=(self.num_kv_heads != self.num_heads))
+            y = y.transpose(1, 2)  # → [B, T, H, D]
+            if self.use_xsa:
+                y = self._xsa(y, v)  # v already [B, T, Hkv, D]
         y = y.contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -844,7 +854,6 @@ class MLP(nn.Module):
 
 
 class ValueEmbedding(nn.Module):
-    """Re-inject token identity into attention values at deep layers."""
     def __init__(self, vocab_size: int, ve_dim: int, kv_dim: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, ve_dim)
@@ -858,15 +867,13 @@ class ValueEmbedding(nn.Module):
 
 
 class SmearGate(nn.Module):
-    """Learned blend of current and previous token — cheap bigram signal."""
     def __init__(self, dim: int):
         super().__init__()
         self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
-        x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
-        return (1.0 - g) * x + g * x_prev
+        return (1.0 - g) * x + g * F.pad(x[:, :-1], (0, 0, 1, 0))
 
 
 class Block(nn.Module):
@@ -899,7 +906,6 @@ class Block(nn.Module):
 
 
 class BigramHashEmbedding(nn.Module):
-    """Learnable bigram-hash embedding bias. Zero-init so it starts as identity."""
     def __init__(self, hash_size: int, proj_dim: int, model_dim: int):
         super().__init__()
         self.hash_size = hash_size
