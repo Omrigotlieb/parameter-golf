@@ -68,6 +68,8 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     z_loss_weight = float(os.environ.get("Z_LOSS_WEIGHT", 1e-4))
+    mtp_num_heads = int(os.environ.get("MTP_NUM_HEADS", 2))
+    mtp_loss_weight = float(os.environ.get("MTP_LOSS_WEIGHT", 0.15))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -466,6 +468,8 @@ def gptq_lite_quantize_state_dict(state_dict: dict[str, Tensor]):
     passthrough: dict[str, Tensor] = {}
     pod: dict[str, str] = {}
     for name, tensor in state_dict.items():
+        if "mtp_heads" in name:
+            continue  # training-only, not in artifact
         t = tensor.detach().cpu().contiguous()
         if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             passthrough[name] = keep_float_tensor(name, t, pod) if t.is_floating_point() else t
@@ -802,6 +806,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         rope_dims: int = 0,
         z_loss_weight: float = 0.0,
+        mtp_num_heads: int = 0,
+        mtp_loss_weight: float = 0.15,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -810,6 +816,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.z_loss_weight = z_loss_weight
+        self.mtp_num_heads = mtp_num_heads
+        self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash = BigramHashEmbedding(hash_size=4096, proj_dim=128, model_dim=model_dim)
         self.smear_gate = SmearGate(model_dim)
@@ -841,6 +849,11 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.mtp_heads = nn.ModuleList(
+            [CastedLinear(model_dim, vocab_size, bias=False) for _ in range(mtp_num_heads)]
+        ) if mtp_num_heads > 0 else nn.ModuleList()
+        for h in self.mtp_heads:
+            h._zero_init = True
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -881,13 +894,25 @@ class GPT(nn.Module):
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self._body(input_ids).reshape(-1, self.tok_emb.weight.size(1))
+        x_3d = self._body(input_ids)
+        x = x_3d.reshape(-1, x_3d.size(-1))
         targets = target_ids.reshape(-1)
         logits = self._logits(x)
         ce = F.cross_entropy(logits.float(), targets, reduction="mean")
         if self.z_loss_weight > 0:
             lse = torch.logsumexp(logits.float(), dim=-1)
             ce = ce + self.z_loss_weight * (lse ** 2).mean()
+        if self.training and self.mtp_num_heads > 0:
+            seqlen = input_ids.size(-1)
+            mtp_sum = ce.new_zeros(())
+            for k, mtp_head in enumerate(self.mtp_heads):
+                vt = seqlen - (k + 1)
+                if vt <= 0:
+                    continue
+                ml = mtp_head(x_3d[:, :vt].reshape(-1, x_3d.size(-1)))
+                ml = self.logit_softcap * torch.tanh(ml / self.logit_softcap)
+                mtp_sum = mtp_sum + F.cross_entropy(ml.float(), target_ids[:, k+1:].reshape(-1), reduction="mean")
+            ce = ce + self.mtp_loss_weight * mtp_sum / max(self.mtp_num_heads, 1)
         return ce
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1003,6 +1028,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         rope_dims=args.rope_dims,
         z_loss_weight=args.z_loss_weight,
+        mtp_num_heads=args.mtp_num_heads,
+        mtp_loss_weight=args.mtp_loss_weight,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1036,6 +1063,8 @@ def main() -> None:
     scalar_params.append(base_model.smear_gate.gate)
     scalar_params.append(base_model.vocab_bias)
     matrix_params.extend(extra_matrix_params)
+    for mh in base_model.mtp_heads:
+        matrix_params.append(mh.weight)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_groups = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if extra_embed_params:
