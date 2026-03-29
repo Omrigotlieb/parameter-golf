@@ -58,7 +58,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 12))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -478,9 +478,11 @@ def gptq_lite_quantize_state_dict(state_dict: dict[str, Tensor]):
             passthrough[name] = t.float().contiguous()
             continue
         if _is_embed_param(name):
-            q, s = quantize_float_tensor(t)  # int8 for embeddings (more precision)
+            q, s = quantize_float_tensor(t)  # int8 for embeddings
+        elif ".mlp." in name:
+            q, s = gptq_lite_quantize_tensor(t, clip_range=15)  # int5 for MLP (best compression)
         else:
-            q, s = gptq_lite_quantize_tensor(t)  # int6 for mlp+attn (better compression)
+            q, s = gptq_lite_quantize_tensor(t, clip_range=31)  # int6 for attention
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")

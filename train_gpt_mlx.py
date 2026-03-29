@@ -83,6 +83,8 @@ class Hyperparameters:
     rope_dims: int = int(os.environ.get("ROPE_DIMS", 16))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
     z_loss_weight: float = float(os.environ.get("Z_LOSS_WEIGHT", 1e-4))
+    mtp_num_heads: int = int(os.environ.get("MTP_NUM_HEADS", 2))
+    mtp_loss_weight: float = float(os.environ.get("MTP_LOSS_WEIGHT", 0.15))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -450,13 +452,16 @@ class BigramHashEmbedding(nn.Module):
 class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float, rope_dims: int = 0, z_loss_weight: float = 0.0):
+                 qk_gain_init: float, rope_dims: int = 0, z_loss_weight: float = 0.0,
+                 mtp_num_heads: int = 0, mtp_loss_weight: float = 0.15):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
         self.z_loss_weight = z_loss_weight
+        self.mtp_num_heads = mtp_num_heads
+        self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.bigram_hash = BigramHashEmbedding(hash_size=10240, proj_dim=128, model_dim=dim)
         self.smear_gate = SmearGate(dim)
@@ -483,6 +488,11 @@ class GPT(nn.Module):
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
+        self.mtp_heads = [
+            CastedLinear(dim, vocab_size) for _ in range(mtp_num_heads)
+        ] if mtp_num_heads > 0 else []
+        for h in self.mtp_heads:
+            h.weight = mx.zeros_like(h.weight)
 
     def softcap(self, logits: mx.array) -> mx.array:
         c = self.logit_softcap
@@ -513,13 +523,27 @@ class GPT(nn.Module):
         return self.softcap(logits_proj)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        x_3d = self(input_ids)
+        x = x_3d.reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         logits = self._logits(x)
         ce = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
         if self.z_loss_weight > 0:
             lse = mx.logsumexp(logits.astype(mx.float32), axis=-1)
             ce = ce + self.z_loss_weight * (lse * lse).mean()
+        if self.mtp_num_heads > 0:
+            seqlen = input_ids.shape[-1]
+            mtp_sum = mx.array(0.0)
+            for k, mtp_head in enumerate(self.mtp_heads):
+                vt = seqlen - (k + 1)
+                if vt <= 0:
+                    continue
+                ml = mtp_head(x_3d[:, :vt].reshape(-1, x_3d.shape[-1]))
+                ml = self.softcap(ml)
+                mtp_sum = mtp_sum + nn.losses.cross_entropy(
+                    ml.astype(mx.float32), target_ids[:, k + 1:].reshape(-1), reduction="mean"
+                )
+            ce = ce + self.mtp_loss_weight * mtp_sum / max(self.mtp_num_heads, 1)
         return ce
 
     def forward_logits(self, input_ids: mx.array) -> mx.array:
@@ -679,6 +703,8 @@ def quantize_state_dict_int8(flat_state: dict[str, mx.array]) -> tuple[dict[str,
         0,
     )
     for name, arr in flat_state.items():
+        if "mtp_heads" in name:
+            continue  # training-only, not in artifact
         stats["param_count"] += int(arr.size)
         stats["num_tensors"] += 1
         stats["baseline_tensor_bytes"] += int(arr.nbytes)
@@ -770,6 +796,8 @@ def gptq_lite_quantize_state_dict(flat_state: dict[str, mx.array]) -> dict[str, 
     passthrough: dict[str, np.ndarray] = {}
     pod: dict[str, str] = {}
     for name, arr in flat_state.items():
+        if "mtp_heads" in name:
+            continue  # training-only, not in artifact
         if not mx.issubdtype(arr.dtype, mx.floating) or int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL:
             passthrough[name] = keep_float_array(name, arr, pod) if mx.issubdtype(arr.dtype, mx.floating) else np.ascontiguousarray(np.array(arr))
             continue
@@ -1034,6 +1062,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         rope_dims=args.rope_dims,
         z_loss_weight=args.z_loss_weight,
+        mtp_num_heads=args.mtp_num_heads,
+        mtp_loss_weight=args.mtp_loss_weight,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1220,7 +1250,7 @@ def main() -> None:
     mx.eval(model.state)
 
     out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state)}
+    flat_state = {k: v for k, v in tree_flatten(model.state) if "mtp_heads" not in k}
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
