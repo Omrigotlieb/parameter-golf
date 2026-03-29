@@ -665,8 +665,8 @@ class CastedLinear(nn.Linear):
         w = self.weight.to(x.dtype)
         if CastedLinear._qat_enabled and self.training and w.ndim == 2:
             with torch.no_grad():
-                s = self.weight.float().abs().amax(dim=1).clamp(min=1e-12) / 127.0
-                w_q = (self.weight.float() / s[:, None]).round().clamp(-127, 127) * s[:, None]
+                s = self.weight.float().abs().amax(dim=1).clamp(min=1e-12) / 31.0
+                w_q = (self.weight.float() / s[:, None]).round().clamp(-31, 31) * s[:, None]
             w = w + (w_q.to(w.dtype) - w).detach()  # STE
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -893,7 +893,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.z_loss_weight = z_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram_hash = BigramHashEmbedding(hash_size=10240, proj_dim=128, model_dim=model_dim)
+        self.bigram_hash = BigramHashEmbedding(hash_size=8192, proj_dim=128, model_dim=model_dim)
         self.smear_gate = SmearGate(model_dim)
         self.vocab_bias = nn.Parameter(torch.zeros(vocab_size, dtype=torch.float32))
         self.value_embeds = nn.ModuleDict()  # reserved for future use
