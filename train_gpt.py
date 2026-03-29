@@ -547,6 +547,8 @@ def gptq_lite_quantize_tensor(t: Tensor, clip_range: int = 31):
     q = torch.round(t32 / s.float()).clamp(-clip_range, clip_range).to(torch.int8)
     return q, s
 
+def _is_embed_param(name: str) -> bool:
+    return "tok_emb" in name or "lm_head" in name or "bigram_hash.embed" in name
 def gptq_lite_quantize_state_dict(state_dict: dict[str, Tensor]):
     quantized: dict[str, Tensor] = {}
     scales: dict[str, Tensor] = {}
@@ -558,11 +560,17 @@ def gptq_lite_quantize_state_dict(state_dict: dict[str, Tensor]):
         if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             passthrough[name] = keep_float_tensor(name, t, pod) if t.is_floating_point() else t
             continue
-        q, s = gptq_lite_quantize_tensor(t)
+        if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS) or "smear" in name:
+            passthrough[name] = t.float().contiguous()
+            continue
+        if _is_embed_param(name):
+            q, s = quantize_float_tensor(t)  # int8 for embeddings (more precision)
+        else:
+            q, s = gptq_lite_quantize_tensor(t)  # int6 for mlp+attn (better compression)
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
-    obj: dict = {"__quant_format__": "gptq_lite_int6_v1", "quantized": quantized,
+    obj: dict = {"__quant_format__": "mixed_int6_int8_v1", "quantized": quantized,
                  "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
     if pod:
         obj["passthrough_orig_dtypes"] = pod
@@ -665,9 +673,9 @@ class CastedLinear(nn.Linear):
         w = self.weight.to(x.dtype)
         if CastedLinear._qat_enabled and self.training and w.ndim == 2:
             with torch.no_grad():
-                s = self.weight.float().abs().amax(dim=1).clamp(min=1e-12) / 31.0
-                w_q = (self.weight.float() / s[:, None]).round().clamp(-31, 31) * s[:, None]
-            w = w + (w_q.to(w.dtype) - w).detach()  # STE
+                s = (self.weight.float().abs().amax(dim=1) / 31.0).clamp_min(1.0 / 31.0)
+                w_q = (torch.clamp(torch.round(self.weight.float() / s[:, None]), -32, 31) * s[:, None]).to(x.dtype)
+            w = w + (w_q - w).detach()  # STE
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
