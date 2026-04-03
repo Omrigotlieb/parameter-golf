@@ -78,6 +78,8 @@ class Hyperparameters:
  slot_enabled = bool(int(os.environ.get("SLOT_ENABLED", "0")))
  slot_steps = int(os.environ.get("SLOT_STEPS", 8))
  slot_lr = float(os.environ.get("SLOT_LR", 0.005))
+ recur_layers = os.environ.get("RECUR_LAYERS", "")
+ recur_start_step = int(os.environ.get("RECUR_START_STEP", 3000))
 _PE_COEFFS = [
  (8.156554524902461,  -22.48329292557795,  15.878769915207462),
  (4.042929935166739,  -2.808917465908714,   0.5000178451051316),
@@ -595,6 +597,8 @@ class GPT(nn.Module):
   self.smear = SmearGate(model_dim)
   self.num_encoder_layers = num_layers // 2
   self.num_decoder_layers = num_layers - self.num_encoder_layers
+  self._recur_active = False
+  self._recur_set = set()
   self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
   self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
   head_dim = model_dim // num_heads
@@ -680,13 +684,19 @@ class GPT(nn.Module):
   x0 = x
   skips: list[Tensor] = []
   ve_cache: dict = {}
-  for i in range(self.num_encoder_layers):
+  recur_active = self._recur_active and hasattr(self, '_recur_set')
+  layer_schedule = list(range(self.num_encoder_layers))
+  if recur_active:
+   cut = max(self._recur_set) + 1
+   layer_schedule = list(range(cut)) + sorted(self._recur_set) + list(range(cut, self.num_encoder_layers))
+  for i in layer_schedule:
    ve = self._get_ve(i, input_ids, ve_cache)
    x = self.blocks[i](x, x0,
     self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
     self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
     v_embed=ve)
-   skips.append(x)
+   if i not in getattr(self, '_recur_set', set()):
+    skips.append(x)
   for i in range(self.num_decoder_layers):
    bi = self.num_encoder_layers + i
    if skips:
@@ -1098,6 +1108,9 @@ f"VOCAB_SIZE mismatch: {args.vocab_size} vs {int(sp.vocab_size())}")
   restore_low_dim_params_to_fp32(m)
   return m
  base_model = _make_gpt(args.mtp_num_heads, args.mtp_loss_weight)
+ if args.recur_layers:
+  base_model._recur_set = set(int(x) for x in args.recur_layers.split(",") if x.strip())
+  log0(f"depth_recurrence:configured layers={sorted(base_model._recur_set)} activate_step={args.recur_start_step}")
  compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
  model = compiled_model
  matrix_params = [
@@ -1292,6 +1305,9 @@ f"VOCAB_SIZE mismatch: {args.vocab_size} vs {int(sp.vocab_size())}")
    for name, t in base_model.state_dict().items():
     ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
   step += 1
+  if not base_model._recur_active and base_model._recur_set and step >= args.recur_start_step:
+   base_model._recur_active = True
+   log0(f"recurrence:activated step:{step} layers:{sorted(base_model._recur_set)}")
   approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
   should_log_train = (
    args.train_log_every > 0
