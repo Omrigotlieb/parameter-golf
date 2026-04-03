@@ -684,19 +684,13 @@ class GPT(nn.Module):
   x0 = x
   skips: list[Tensor] = []
   ve_cache: dict = {}
-  recur_active = self._recur_active and hasattr(self, '_recur_set')
-  layer_schedule = list(range(self.num_encoder_layers))
-  if recur_active:
-   cut = max(self._recur_set) + 1
-   layer_schedule = list(range(cut)) + sorted(self._recur_set) + list(range(cut, self.num_encoder_layers))
-  for i in layer_schedule:
+  for i in range(self.num_encoder_layers):
    ve = self._get_ve(i, input_ids, ve_cache)
    x = self.blocks[i](x, x0,
     self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
     self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
     v_embed=ve)
-   if i not in getattr(self, '_recur_set', set()):
-    skips.append(x)
+   skips.append(x)
   for i in range(self.num_decoder_layers):
    bi = self.num_encoder_layers + i
    if skips:
