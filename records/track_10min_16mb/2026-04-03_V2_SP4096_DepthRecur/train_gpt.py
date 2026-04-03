@@ -1419,6 +1419,117 @@ def timed_eval(label: str, fn, *args, **kwargs) -> tuple[float, float]:
     return val_loss, val_bpb
 
 
+def eval_val_slot(
+    h: Hyperparameters,
+    device: torch.device,
+    val_data: ValidationData,
+    base_model: GPT,
+    batch_seqs: int = 32,
+) -> tuple[float, float]:
+    """SLOT eval: optimize a per-batch delta vector on frozen backbone hidden states."""
+    base_model.eval()
+    seq_len = h.eval_seq_len
+    context_size = seq_len - h.eval_stride
+    total_tokens = val_data.val_tokens.numel() - 1
+
+    window_starts = [ws for ws in range(0, total_tokens, h.eval_stride)
+                     if ws + context_size < total_tokens]
+
+    total_windows = len(window_starts)
+    my_s = (total_windows * h.rank) // h.world_size
+    my_e = (total_windows * (h.rank + 1)) // h.world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    d_model = h.model_dim
+
+    for bi in range(0, len(my_windows), batch_seqs):
+        batch_ws = my_windows[bi:bi + batch_seqs]
+        bsz = len(batch_ws)
+
+        x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+        y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+        wlens: list[int] = []
+
+        for i, ws in enumerate(batch_ws):
+            we = min(ws + seq_len, total_tokens)
+            wlen = we - ws
+            wlens.append(wlen)
+            chunk = val_data.val_tokens[ws:we + 1].to(dtype=torch.int64, device=device)
+            x_batch[i, :wlen] = chunk[:-1]
+            y_batch[i, :wlen] = chunk[1:]
+
+        # Get frozen backbone hidden states
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            hidden = base_model.forward_backbone(x_batch).detach()
+
+        # Optimize a delta vector [bsz, 1, d_model]
+        delta = torch.zeros(bsz, 1, d_model, device=device, dtype=hidden.dtype, requires_grad=True)
+        slot_opt = torch.optim.AdamW([delta], lr=h.slot_lr)
+
+        for _ in range(h.slot_steps):
+            slot_opt.zero_grad()
+            h_shifted = hidden + delta
+            if base_model.head_proj is not None:
+                h_out = base_model.head_proj(h_shifted)
+            else:
+                h_out = h_shifted
+            if base_model.tie_embeddings:
+                logits = F.linear(h_out, base_model.tok_emb.weight)
+            else:
+                logits = base_model.lm_head(h_out)
+            logits = base_model.logit_softcap * torch.tanh(logits / base_model.logit_softcap)
+            slot_loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="mean",
+            )
+            slot_loss.backward()
+            slot_opt.step()
+
+        # Score with optimized delta
+        with torch.no_grad():
+            h_shifted = hidden + delta
+            if base_model.head_proj is not None:
+                h_out = base_model.head_proj(h_shifted)
+            else:
+                h_out = h_shifted
+            if base_model.tie_embeddings:
+                logits = F.linear(h_out, base_model.tok_emb.weight)
+            else:
+                logits = base_model.lm_head(h_out)
+            logits = base_model.logit_softcap * torch.tanh(logits / base_model.logit_softcap)
+
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else context_size
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+                tgt = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                tb = val_data.base_bytes_lut[tgt].to(torch.float64)
+                tb += (val_data.has_leading_space_lut[tgt] & ~val_data.is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    base_model.train()
+    return _loss_bpb(loss_sum, token_count, byte_count)
+
+
 def run_evals(
     h: Hyperparameters,
     device: torch.device,
@@ -1429,6 +1540,8 @@ def run_evals(
     timed_eval("final_int6_roundtrip", eval_val, h, device, val_data, compiled_model)
     if h.sliding_window_enabled:
         timed_eval("final_int6_sliding_window", eval_val_sliding, h, device, val_data, eval_model)
+    if h.slot_enabled:
+        timed_eval("final_int6_slot", eval_val_slot, h, device, val_data, eval_model)
 
 # -----------------------------
 # Training
@@ -1543,6 +1656,11 @@ def train_model(h: Hyperparameters, device: torch.device, val_data: ValidationDa
                     f"step: {step}/{h.iterations}"
                 )
             break
+
+        # Activate depth recurrence once we reach the start step
+        if not base_model._recur_active and base_model._recur_set and step >= h.recur_start_step:
+            base_model._recur_active = True
+            log(f"depth_recurrence:activated at step {step}, layers={sorted(base_model._recur_set)}")
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         frac = training_frac(step, elapsed_ms)
