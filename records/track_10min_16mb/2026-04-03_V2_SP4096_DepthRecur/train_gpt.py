@@ -452,10 +452,10 @@ class GPT(nn.Module):
         self.tie_embeddings=h.tie_embeddings
         self.tied_embed_init_std=h.tied_embed_init_std
         self.logit_softcap=h.logit_softcap
-        self._recur_active=False
         self._recur_set=set()
         if h.recur_layers:
             self._recur_set={int(x) for x in h.recur_layers.split(",") if x.strip()}
+        self._recur_active=bool(self._recur_set)
         self.tok_emb=nn.Embedding(h.vocab_size,h.embedding_dim)
         if h.embedding_dim!=h.model_dim:
             self.embed_proj=CastedLinear(h.embedding_dim,h.model_dim,bias=False)
@@ -1161,9 +1161,6 @@ def train_model(h,device,vd):
             if sas is not None and step<h.iterations:
                 log(f"stopping_early: wallclock_cap train_time: {ttms:.0f}ms step: {step}/{h.iterations}")
             break
-        if not bm._recur_active and bm._recur_set and step>=h.recur_start_step:
-            bm._recur_active=True
-            log(f"depth_recurrence:activated at step {step}, layers={sorted(bm._recur_set)}")
         ems=ttms+1000.0*(time.perf_counter()-t0)
         frac=tfrac(step,ems)
         tl=sfn(step,lrmul(frac))
