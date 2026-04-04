@@ -40,7 +40,7 @@ class Hyperparameters():
     ve_enabled=bool(int(_E('VE_ENABLED','1')))
     ve_dim=int(_E('VE_DIM',128))
     ve_layers=_E('VE_LAYERS','9,10')
-    qk_gain_init=float(_E('QK_GAIN_INIT',4.0))
+    qk_gain_init=float(_E('QK_GAIN_INIT',5.0))
     min_lr=float(_E('MIN_LR',0.0))
     embed_lr=float(_E('EMBED_LR',0.6))
     head_lr=float(_E('HEAD_LR',0.008))
@@ -64,6 +64,8 @@ class Hyperparameters():
     ema_decay=float(_E('EMA_DECAY',0.997))
     recur_layers=_E('RECUR_LAYERS','')
     recur_start_step=int(_E('RECUR_START_STEP',3000))
+    parallel_residual=bool(int(_E('PARALLEL_RESIDUAL','0')))
+    parallel_start_layer=int(_E('PARALLEL_START_LAYER','7'))
     slot_enabled=bool(int(_E('SLOT_ENABLED','0')))
     slot_steps=int(_E('SLOT_STEPS',8))
     slot_lr=float(_E('SLOT_LR',0.005))
@@ -456,6 +458,11 @@ class GPT(nn.Module):
         if h.recur_layers:
             self._recur_set={int(x) for x in h.recur_layers.split(",") if x.strip()}
         self._recur_active=bool(self._recur_set)
+        self.parallel_residual=h.parallel_residual
+        self.parallel_start_layer=h.parallel_start_layer
+        if h.parallel_residual:
+            self.pr_post=nn.Parameter(torch.ones(h.num_layers,2,2,dtype=torch.float32))
+            self.pr_resid=nn.Parameter(torch.full((h.num_layers,2),1.1**0.5,dtype=torch.float32))
         self.tok_emb=nn.Embedding(h.vocab_size,h.embedding_dim)
         if h.embedding_dim!=h.model_dim:
             self.embed_proj=CastedLinear(h.embedding_dim,h.model_dim,bias=False)
@@ -508,6 +515,18 @@ class GPT(nn.Module):
         vb=ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         vi=self.ve_layer_indices.index(li)
         return vb*self.ve_layer_scales[vi].to(dtype=vb.dtype)
+    def _par_block(self,li,lane0,lane1,x0,v_embed=None):
+        blk=self.blocks[li]
+        mix=blk.resid_mix.to(dtype=lane0.dtype)
+        xi0=mix[0][None,None,:]*lane0+mix[1][None,None,:]*x0
+        xi1=mix[0][None,None,:]*lane1+mix[1][None,None,:]*x0
+        ao=blk.attn_scale.to(dtype=lane0.dtype)[None,None,:]*blk.attn(blk.attn_norm(xi0)*blk.ln_scale_factor,v_embed=v_embed)
+        mo=blk.mlp_scale.to(dtype=lane0.dtype)[None,None,:]*blk.mlp(blk.mlp_norm(xi1)*blk.ln_scale_factor)
+        pw=self.pr_post[li].to(dtype=lane0.dtype)
+        r=self.pr_resid[li].to(dtype=lane0.dtype)
+        new0=r[0]*lane0+pw[0,0]*ao+pw[1,0]*mo
+        new1=r[1]*lane1+pw[0,1]*ao+pw[1,1]*mo
+        return new0,new1
     def forward_backbone(self,input_ids):
         x=self.tok_emb(input_ids)
         x=F.rms_norm(x,(x.size(-1),))
@@ -524,12 +543,35 @@ class GPT(nn.Module):
             if i==mr:
                 schedule.extend(rs)
         seen=set()
+        pr=self.parallel_residual
+        psl=self.parallel_start_layer if pr else len(self.blocks)+1
+        lane0=lane1=None
         for li in schedule:
             first=li not in seen
             seen.add(li)
             enc=li<self.num_encoder_layers
-            if enc:
-                ve=self._get_ve(li,input_ids,vc)
+            ve=self._get_ve(li,input_ids,vc)
+            if pr and li>=psl:
+                if lane0 is None:
+                    lane0=lane1=x
+                di=li-self.num_encoder_layers
+                if enc:
+                    lane0,lane1=self._par_block(li,lane0,lane1,x0,v_embed=ve)
+                    if first:
+                        skips.append((lane0+lane1)*0.5)
+                else:
+                    if first and skips:
+                        sk=skips.pop()
+                        ss=self.skip_weights[di].to(dtype=x.dtype)[None,None,:]*sk
+                        if self.skip_gates is not None:
+                            g=torch.sigmoid(self.skip_gates[di].to(dtype=x.dtype))[None,None,:]
+                            lane0=torch.lerp(ss,lane0,g)
+                            lane1=torch.lerp(ss,lane1,g)
+                        else:
+                            lane0=lane0+ss
+                            lane1=lane1+ss
+                    lane0,lane1=self._par_block(li,lane0,lane1,x0,v_embed=ve)
+            elif enc:
                 x=self.blocks[li](x,x0,v_embed=ve)
                 if first:
                     skips.append(x)
@@ -542,8 +584,9 @@ class GPT(nn.Module):
                         x=torch.lerp(ss,x,g)
                     else:
                         x=x+ss
-                ve=self._get_ve(li,input_ids,vc)
                 x=self.blocks[li](x,x0,v_embed=ve)
+        if lane0 is not None:
+            x=(lane0+lane1)*0.5
         return self.final_norm(x)
     def _head_logits(self,h):
         if self.head_proj is not None:
@@ -628,7 +671,7 @@ class Muon(torch.optim.Optimizer):
                 p.add_(g,alpha=-lr)
                 cur+=p.numel()
         return loss
-CTRL_PAT=tuple(p for p in _E("CONTROL_TENSOR_NAME_PATTERNS","attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,ve_layer_scales,ve_shared.scale").split(",") if p)
+CTRL_PAT=tuple(p for p in _E("CONTROL_TENSOR_NAME_PATTERNS","attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gates,ve_layer_scales,ve_shared.scale,pr_post,pr_resid").split(",") if p)
 _I8SD=torch.float16
 _I8CP=99.99984
 _I8CQ=_I8CP/100.0
@@ -1048,6 +1091,9 @@ class Optimizers():
             sp.append(bm.skip_weights)
         if bm.skip_gates is not None and bm.skip_gates.numel()>0:
             sp.append(bm.skip_gates)
+        if hasattr(bm,'pr_post'):
+            sp.append(bm.pr_post)
+            sp.append(bm.pr_resid)
         tlr=h.tied_embed_lr if h.tie_embeddings else h.embed_lr
         tp=[{"params":[bm.tok_emb.weight],"lr":tlr,"base_lr":tlr}]
         if bm.ve_shared is not None:
